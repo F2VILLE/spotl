@@ -1,0 +1,9 @@
+#!/bin/bash
+
+search_q=$(walker -d -I -p "Search a track on Spotify" 2>/dev/null)
+res=$(curl -G "http://127.0.0.1:8192/search" --data-urlencode "q=$search_q" 2>/dev/null)
+echo $res
+track=$(echo -e "$res" | walker -d 2>/dev/null)
+track_id=$(echo $track | grep -oP '(?<=\().*(?=\))')
+
+curl "http://127.0.0.1:8192/play?track_id=$track_id"

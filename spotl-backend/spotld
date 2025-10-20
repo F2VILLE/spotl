@@ -1,0 +1,244 @@
+#!/home/f2ville/Dev/SpotifyLauncher/spotl-backend/ve/bin/python3
+
+import requests as req
+import dotenv
+import os
+import json
+import urllib.parse
+import uuid
+from flask import Flask, request, Response
+import base64
+from flask_socketio import SocketIO
+import time
+from pathlib import Path
+
+
+
+print(f"loading dotenv : {os.path.join(Path(__file__).parent.resolve(), ".env")}")
+TOKEN_FILE = os.path.join(Path(__file__).parent.resolve(), "token.json")
+print(f"Token file : {TOKEN_FILE}")
+dotenv.load_dotenv(os.path.join(Path(__file__).parent.resolve(), ".env"))
+SPOT_ID = os.environ.get("SPOT_ID") or ""
+SPOT_SECRET = os.environ.get("SPOT_SECRET") or ""
+
+PORT = int(os.environ.get("PORT") or "8192") or 8192
+
+pending_login_request = None
+ACCESS_TOKEN = None
+
+app = Flask(__name__)
+spt = None
+socketio = SocketIO(app)
+
+class AccessToken:
+    def __init__(self, access_token: str, refresh_token: str, file_path: str) -> None:
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.file_path = file_path
+    
+    def refresh(self):
+        print("[DEBUG] Refreshing token")
+        id_and_secret = SPOT_ID + ":" + SPOT_SECRET
+        b64auth = base64.b64encode(id_and_secret.encode()).decode()
+        res = req.post("https://accounts.spotify.com/api/token",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {b64auth}"
+                },
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": self.refresh_token,
+                }
+            )
+        try:
+            res.raise_for_status()
+            data = res.json()
+            self.access_token = data['access_token']
+            self.refresh_token = data['refresh_token']
+            self.store()
+        except Exception as e:
+            print(e)
+
+    def store(self):
+        with open(self.file_path, "w") as f:
+            json.dump({
+                "access_token": self.access_token,
+                "refresh_token": self.refresh_token
+            }, f)
+    
+    @staticmethod
+    def load(file_path: str):
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+                if not data or not "access_token" in data or not "refresh_token" in data:
+                    return None
+            return AccessToken(data["access_token"], data["refresh_token"], file_path)
+        except:
+            return None
+
+
+@app.route("/login")
+def get_url():
+    global pending_login_request
+    state = uuid.uuid4().hex
+    scope = "user-read-playback-state,user-read-private,user-modify-playback-state"
+    redirect_uri = f"http://127.0.0.1:{PORT}/callback"
+    
+    auth_url = "https://accounts.spotify.com/authorize"
+    params = {
+        "response_type": "code",
+        "client_id": SPOT_ID,
+        "scope": scope,
+        "redirect_uri": redirect_uri,
+        "state": state
+    }
+    
+    pending_login_request = params
+
+    return Response(
+        status=302,
+        headers={"Location": f"{auth_url}?{urllib.parse.urlencode(params)}"}
+    )
+
+def shutdown_server():
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        raise RuntimeError('Not running with the Werkzeug Server')
+    func()
+
+@app.route("/callback")
+def callback():
+    global ACCESS_TOKEN
+    global pending_login_request
+    code = request.args.get("code", None)
+    state = request.args.get("state", None)
+    if not pending_login_request or not code or state != pending_login_request["state"]:
+        return "<p>Error: State mismatch.</p>"
+    id_and_secret = SPOT_ID + ":" + SPOT_SECRET
+    b64auth = base64.b64encode(id_and_secret.encode()).decode()
+    res = req.post("https://accounts.spotify.com/api/token", headers={
+            "content-type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {b64auth}"
+        },
+        data={
+            "code": code,
+            "redirect_uri": f"http://127.0.0.1:{PORT}/callback",
+            "grant_type": "authorization_code"
+        })
+    try:
+        res.raise_for_status()
+    except req.exceptions.HTTPError as e:
+        print(f"HTTP error occurred: {e}")
+        print(f"Response content: {res.text}") 
+        return "<p>Error: Unable to fetch token.</p>"
+    res_data = res.json()
+    ACCESS_TOKEN = AccessToken(res_data["access_token"], res_data["refresh_token"], TOKEN_FILE)
+    ACCESS_TOKEN.store()
+    print("Successfully authenticated ! You can now use the program.")
+    # os._exit(0)
+    return "<p>Authentication successful! You can close this window.</p>"
+
+@app.get("/search")
+def search():
+    global spt
+    query = request.args.get("q", None)
+    print(spt.user)
+    if not query or not spt:
+        return ""
+    res = spt.get(f"/search?q={query}&type=track&market={spt.user["country"]}&limit=10")
+    tracks = res['tracks']['items']
+    out = ""
+    for t in tracks:
+        out += f"{t['name']} - {t['artists'].pop(0)['name']} ({t['id']})\n"
+    return out
+
+@app.get("/play")
+def play():
+    global spt
+    track_id = request.args.get("track_id")
+    if not track_id:
+        return "error"
+    spt.play("spotify:track:" + track_id)
+    return ""
+
+class Spotify:
+    def __init__(self, token: AccessToken) -> None:
+        self.token = token
+        self.user = self.get("/me")
+
+    def get_user(self):
+        self.user = self.get("/me")
+        return self.user
+    
+    def play(self, track_id: str):
+        res = self.put("/me/player/play", data={
+            "uris": [
+                track_id
+            ],
+            "position_ms": 0
+        }, empty_response=True)
+
+
+    def put(self, endpoint: str, data: dict | None = None,retry = True, empty_response=False):
+        # print(f"[SPOTIFY] Fetching https://api.spotify.com/v1{endpoint}")
+
+        res = req.put(f"https://api.spotify.com/v1{endpoint}", headers={
+            "Authorization": f"Bearer {self.token.access_token}",
+            "Content-Type": "application/json"
+        },
+            json=data
+        )
+        print(json.dumps(data))
+        if (res.status_code == 401 and retry):
+            self.token.refresh()
+            time.sleep(2)
+            return self.put(endpoint, retry=False)
+        
+        try:
+            res.raise_for_status()
+        except Exception as e:
+            print(f"Error in PUT request: {e}")
+        if empty_response:
+            return True
+        res_data = res.json()
+        
+        if 'error' in res_data:
+            raise Exception(f"Error fetching data: {res_data['error']}")
+
+        return res_data
+    
+    def get(self, endpoint: str, data: dict | None = None,retry = True):
+        # print(f"[SPOTIFY] Fetching https://api.spotify.com/v1{endpoint}")
+        res = req.get(f"https://api.spotify.com/v1{endpoint}", headers={
+            "Authorization": f"Bearer {self.token.access_token}",
+        },
+            data=data
+        )
+        if (res.status_code == 401 and retry):
+            self.token.refresh()
+            time.sleep(2)
+            return self.get(endpoint, retry=False)
+        
+        res.raise_for_status()
+        res_data = res.json()
+        
+        if 'error' in res_data:
+            raise Exception(f"Error fetching data: {res_data['error']}")
+
+        return res_data
+
+if __name__ == "__main__":
+    if not SPOT_ID or not SPOT_SECRET:
+        raise Exception("Missing Spotify client id or secret !")
+    ACCESS_TOKEN = AccessToken.load(TOKEN_FILE)
+    if not ACCESS_TOKEN:
+        print(f"Please login : http://127.0.0.1:{PORT}/login")
+    else:
+        spt = Spotify(ACCESS_TOKEN)
+        print(f"Logged in as [{spt.user['display_name']}]")
+        np = spt.get("/me/player")
+        if 'device' in np and np['device']['is_active']:
+            print(f"Currently playing on '{np['device']['name']}'")
+    socketio.run(app, host="127.0.0.1", port=PORT)
+        
